@@ -20,22 +20,22 @@ This repository houses a modular scraping pipeline that not only fetches raw dat
 ```bash
 git clone https://github.com/AlluvianDev/websitescraper.git
 cd websitescraper
-
+```
 
 Ensure you have the necessary Python dependencies installed in your virtual environment (e.g., requests, BeautifulSoup, playwright, database connectors).
 
 Usage
 Run the main scraper to begin data extraction:
-
+```
 python scrapermain.py
-
+```
 Check the integrity of your database rows:
-
+```
 python rowcheck.py
-
+```
 
 Run the AI backfill pipeline to clean and process unstructured data:
-
+```
 python backfill_ai.py
-
+```
 Feel free to suggest new ideas!
