@@ -4,27 +4,13 @@ import sqlite3
 import requests
 import sys
 import urllib3
-import json
 from collections import deque
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import ollama
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-class AIProcessor:
-    def __init__(self, model="llama3.2:1b"):
-        self.model = model
-
-    def summarize_and_tag(self, text):
-        try:
-            prompt = f"Summarize this university webpage in one short sentence and provide 3 keywords. Format as JSON: {text[:2000]}"
-            response = ollama.generate(model=self.model, prompt=prompt, format="json")
-            return json.loads(response['response'])
-        except Exception:
-            return {"summary": "N/A", "keywords": []}
 
 class PageParser:
     def parse(self, html, base_url):
@@ -56,8 +42,6 @@ class DatabaseManager:
                 url TEXT UNIQUE,
                 title TEXT,
                 content TEXT,
-                summary TEXT,
-                keywords TEXT,
                 crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -68,14 +52,13 @@ class DatabaseManager:
                 FOREIGN KEY(source_url) REFERENCES pages(url)
             )
         ''')
-        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_target_url ON links(target_url)')
         self.conn.commit()
 
-    def save_page(self, url, title, content, summary, keywords, found_links):
+    def save_page(self, url, title, content, found_links):
         try:
             self.cursor.execute(
-                "INSERT OR IGNORE INTO pages (url, title, content, summary, keywords) VALUES (?, ?, ?, ?, ?)",
-                (url, title, content, summary, json.dumps(keywords))
+                "INSERT OR IGNORE INTO pages (url, title, content) VALUES (?, ?, ?)",
+                (url, title, content)
             )
             
             link_data = [(url, link) for link in found_links]
@@ -94,54 +77,71 @@ class DatabaseManager:
 
 class Crawler:
     def __init__(self, start_url, max_pages=100000):
-        os.nice(15)
-        self.queue = deque([])
+        self.queue = deque([])  # Start empty, we will fill it from DB
         self.seen = set()
-        self.dead_domains = set()
         self.max_pages = max_pages
         self.parser = PageParser()
         self.db = DatabaseManager()
-        self.ai = AIProcessor()
         self.page_count = 0
         
+        print("--- RESUMING CRAWL ---", flush=True)
+
+        # 1. Load pages we have already finished (The "Done" list)
+        print("Loading visited pages...", flush=True)
         self.db.cursor.execute("SELECT url FROM pages")
         visited_urls = [row[0] for row in self.db.cursor.fetchall()]
         self.page_count = len(visited_urls)
         
+        # Add them to 'seen' so we don't crawl them again
         for url in visited_urls:
             self.seen.add(url)
+        print(f"Loaded {self.page_count} finished pages.", flush=True)
 
-        self.db.cursor.execute("SELECT DISTINCT target_url FROM links")
-        all_targets = [row[0] for row in self.db.cursor.fetchall()]
+        # 2. Find links we saw but haven't crawled yet (The "To Do" list)
+        print("Rebuilding queue from pending links (this might take a moment)...", flush=True)
+        # This SQL finds links that appear in 'links' table but NOT in 'pages' table
+        self.db.cursor.execute("""
+            SELECT DISTINCT target_url 
+            FROM links 
+            WHERE target_url NOT IN (SELECT url FROM pages)
+        """)
         
-        for link in all_targets:
-            if link not in self.seen and "iyte.edu.tr" in urlparse(link).netloc:
+        pending_links = [row[0] for row in self.db.cursor.fetchall()]
+        
+        count_added = 0
+        for link in pending_links:
+            # Only add valid IYTE links that we haven't 'seen' yet
+            if "iyte.edu.tr" in urlparse(link).netloc and link not in self.seen:
                 self.queue.append(link)
-                self.seen.add(link)
+                self.seen.add(link) # Mark as seen so we don't queue it twice
+                count_added += 1
 
+        print(f"Resurrection complete! Added {count_added} pages to the queue.", flush=True)
+        
+        # If queue is empty (e.g., first run), start with the start_url
         if not self.queue and self.page_count == 0:
             self.queue.append(start_url)
             self.seen.add(start_url)
 
+        # --------------------------------------
+
         self.session = requests.Session()
-        retry = Retry(connect=3, backoff_factor=1)
+        retry = Retry(connect=3, backoff_factor=0.5)
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
             'Connection': 'keep-alive',
         })
 
     def is_valid_link(self, url):
         try:
             parsed = urlparse(url)
-            
-            if parsed.netloc in self.dead_domains:
-                return False
-                
-            blacklisted_ext = ('.pdf', '.jpg', '.png', '.zip', '.docx', '.xlsx', '.pptx', '.mp4')
+            # Sadece HTML olabilecek linkleri kabul et
+            blacklisted_ext = ('.pdf', '.jpg', '.png', '.zip', '.docx', '.xlsx')
             if any(url.lower().endswith(ext) for ext in blacklisted_ext):
                 return False
                 
@@ -150,49 +150,42 @@ class Crawler:
             return False
 
     def run(self):
-        print(f"Startup complete. Resuming crawl from page {self.page_count}...", flush=True)
+        print(f"Starting crawl at {time.strftime('%X')}", flush=True)
         
         while self.queue and self.page_count < self.max_pages:
             current_url = self.queue.popleft()
             
             try:
-                response = self.session.get(current_url, timeout=10, verify=False)
+                print(f"[{self.page_count + 1}] Processing: {current_url}", flush=True)
+                
+                response = self.session.get(current_url, timeout=15, verify=False)
                 
                 if response.status_code != 200:
+                    print(f"   Skipping {current_url} (Status: {response.status_code})", flush=True)
                     continue
 
                 if "text/html" not in response.headers.get("Content-Type", ""):
                     continue
 
                 title, text, links = self.parser.parse(response.content, current_url)
-                
-                ai_data = self.ai.summarize_and_tag(text)
-                
-                summary_text = ai_data.get('summary', 'N/A')
-                keywords_list = ai_data.get('keywords', [])
-                
-                self.db.save_page(current_url, title, text, summary_text, keywords_list, links)
+                self.db.save_page(current_url, title, text, links)
                 self.page_count += 1
                 
-                if self.page_count % 10 == 0:
-                    print(f"Heartbeat: Scraped {self.page_count} pages. Currently on: {current_url}", flush=True)
-                
+                new_links_count = 0
                 for link in links:
                     if self.is_valid_link(link):
                         self.seen.add(link)
                         self.queue.append(link)
+                        new_links_count += 1
                 
-                time.sleep(2)
+                print(f"   Found {new_links_count} new links", flush=True)
+                time.sleep(0.5)
 
-            except requests.exceptions.ConnectionError as e:
-                domain = urlparse(current_url).netloc
-                self.dead_domains.add(domain)
-                print(f"Blocked dead domain: {domain}", file=sys.stderr, flush=True)
-                
             except Exception as e:
-                pass
+                print(f"   Failed to process {current_url}: {e}", file=sys.stderr, flush=True)
                 
         self.db.close()
+        print("Crawl completed.", flush=True)
 
 if __name__ == "__main__":
     start_url = "https://iyte.edu.tr/"

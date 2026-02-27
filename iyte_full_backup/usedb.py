@@ -10,14 +10,14 @@ def search_db(keyword):
     start_time = time.time()
 
     query = """
-        SELECT url, title, summary, keywords 
+        SELECT url, title 
         FROM pages 
-        WHERE content LIKE ? OR title LIKE ? OR summary LIKE ? OR keywords LIKE ?
+        WHERE content LIKE ? OR title LIKE ? 
         LIMIT 100
     """
     
     wildcard_keyword = f"%{keyword}%"
-    cursor.execute(query, (wildcard_keyword, wildcard_keyword, wildcard_keyword, wildcard_keyword))
+    cursor.execute(query, (wildcard_keyword, wildcard_keyword))
     results = cursor.fetchall()
     
     end_time = time.time()
@@ -25,16 +25,17 @@ def search_db(keyword):
 
     print(f"\nFound {len(results)} results in {duration:.2f} ms:\n")
 
-    for i, (url, title, summary, keywords) in enumerate(results, 1):
+    for i, (url, title) in enumerate(results, 1):
+        # --- FIX STARTS HERE ---
+        # If title is None (missing), use the URL as the title
         if title is None:
             title = url
+        # --- FIX ENDS HERE ---
 
         clean_title = title.replace('\n', ' ').strip()
         print(f"{i}. {clean_title}")
-        print(f"   URL: {url}")
-        print(f"   Summary: {summary}")
-        print(f"   Keywords: {keywords}")
-        print("-" * 50)
+        print(f"   {url}")
+        print("-" * 40)
 
     conn.close()
 

@@ -68,7 +68,6 @@ class DatabaseManager:
                 FOREIGN KEY(source_url) REFERENCES pages(url)
             )
         ''')
-        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_target_url ON links(target_url)')
         self.conn.commit()
 
     def save_page(self, url, title, content, summary, keywords, found_links):
@@ -111,11 +110,16 @@ class Crawler:
         for url in visited_urls:
             self.seen.add(url)
 
-        self.db.cursor.execute("SELECT DISTINCT target_url FROM links")
-        all_targets = [row[0] for row in self.db.cursor.fetchall()]
+        self.db.cursor.execute("""
+            SELECT DISTINCT target_url 
+            FROM links 
+            WHERE target_url NOT IN (SELECT url FROM pages)
+        """)
         
-        for link in all_targets:
-            if link not in self.seen and "iyte.edu.tr" in urlparse(link).netloc:
+        pending_links = [row[0] for row in self.db.cursor.fetchall()]
+        
+        for link in pending_links:
+            if "iyte.edu.tr" in urlparse(link).netloc and link not in self.seen:
                 self.queue.append(link)
                 self.seen.add(link)
 
@@ -131,6 +135,7 @@ class Crawler:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
             'Connection': 'keep-alive',
         })
 
@@ -150,8 +155,6 @@ class Crawler:
             return False
 
     def run(self):
-        print(f"Startup complete. Resuming crawl from page {self.page_count}...", flush=True)
-        
         while self.queue and self.page_count < self.max_pages:
             current_url = self.queue.popleft()
             
@@ -174,9 +177,6 @@ class Crawler:
                 self.db.save_page(current_url, title, text, summary_text, keywords_list, links)
                 self.page_count += 1
                 
-                if self.page_count % 10 == 0:
-                    print(f"Heartbeat: Scraped {self.page_count} pages. Currently on: {current_url}", flush=True)
-                
                 for link in links:
                     if self.is_valid_link(link):
                         self.seen.add(link)
@@ -185,12 +185,12 @@ class Crawler:
                 time.sleep(2)
 
             except requests.exceptions.ConnectionError as e:
+                print(f"Dead domain blocked: {current_url}", file=sys.stderr)
                 domain = urlparse(current_url).netloc
                 self.dead_domains.add(domain)
-                print(f"Blocked dead domain: {domain}", file=sys.stderr, flush=True)
                 
             except Exception as e:
-                pass
+                print(f"Error processing {current_url}: {e}", file=sys.stderr)
                 
         self.db.close()
 
